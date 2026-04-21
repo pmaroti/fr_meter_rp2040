@@ -1,0 +1,224 @@
+; -----------------------------------------------------------------------------
+; Frequency Meter PIO Programs
+; -----------------------------------------------------------------------------
+; This file contains two cooperating state machines:
+;   1) `gate`     : Creates a periodic gate pulse and raises IRQ 0 at end of gate.
+;   2) `fin_cntr` : Counts input edges while gate is active, then pushes result.
+;
+; High-level measurement flow:
+;   - CPU preloads both SM TX FIFOs with initial values.
+;   - `gate` drives a side-set output high for a fixed number of cycles.
+;   - `fin_cntr` decrements X on each full input pulse (low->high transition pair).
+;   - When gate ends, `gate` raises IRQ 0.
+;   - `fin_cntr` detects gate end through `jmp pin`, snapshots X, and `push`es value.
+;   - CPU IRQ handler reads RX FIFO and reloads both SMs for the next window.
+;
+; Counter convention:
+;   - `fin_cntr` starts from UINT32_MAX and counts DOWN.
+;   - Pulses counted = UINT32_MAX - captured_x
+;   - Host converts pulses per gate interval into frequency.
+;
+; -----------------------------------------------------------------------------
+; Timing Reference (Datasheet-style)
+; -----------------------------------------------------------------------------
+; Definitions:
+;   - N            : gate preload value written by CPU (OSR <- TX FIFO word)
+;   - f_sm         : PIO state-machine instruction clock after divider
+;   - Tsm          : 1 / f_sm
+;   - div          : SM clock divider (default 1.0 unless configured)
+;   - f_sys_pio    : PIO source clock
+;   - f_sm         = f_sys_pio / div
+;
+; Gate timing model (from `gate` program as written):
+;   - Startup-only instruction delay: `mov x, y [5]` adds 5 extra cycles once.
+;   - High phase loop: `jmp y--, loop side 1`
+;     For y initialized to N, this instruction executes (N + 1) times.
+;     -> T_high ≈ (N + 1) * Tsm
+;   - Low phase after high:
+;     `nop side 0` + `mov y, x` + loop2(`jmp y--`) + `nop` + `irq wait 0`
+;     loop2 executes (N + 1) times; remaining fixed instructions add constants.
+;     -> T_low ≈ (N + 5) * Tsm  +  T_irq_wait
+;        where T_irq_wait is data/host dependent (0 when IRQ clear immediately).
+;   - Measurement cadence (IRQ-to-IRQ) is dominated by T_high + T_low.
+;
+; Frequency estimate:
+;   - Let P be counted pulses during active gate-high interval.
+;   - f_in ≈ P / T_gate_effective
+;   - Current host code uses scale factor for nominal 0.1 s gate:
+;       f_MHz = P / 100000.0
+;     which assumes T_gate_effective = 0.1 s.
+;
+; Practical note:
+;   - Exact absolute timing depends on actual SM clock and any stall at
+;     `irq wait 0`. For metrology-grade accuracy, calibrate T_gate_effective
+;     against a reference clock or enforce deterministic IRQ service latency.
+
+.program gate
+.side_set 1 opt
+.wrap_target    
+    ; Block until host provides a gate-duration count in TX FIFO.
+    ; Side-set is forced low while loading.
+    pull side 0
+
+    ; Keep a persistent copy in Y and mirror it to X.
+    ; Y is consumed during loops; X stores the original reload value.
+    mov y, osr
+
+    ; Small startup delay ([5]) before entering first high-gate phase.
+    ; This can help align/reduce race at initial start.
+    mov x, y [5]
+loop:
+    ; Gate-high phase:
+    ; - side-set drives gate pin high
+    ; - decrement Y until it reaches zero
+    ; - for initial Y=N: executes (N+1) cycles -> T_high ≈ (N+1)*Tsm
+    jmp y--, loop side 1
+
+    ; One-cycle low transition between gate windows.
+    nop side 0
+
+    ; Reload Y from preserved X to repeat same interval indefinitely.
+    mov y, x
+loop2:
+    ; Gate-low "dead time" phase of matching duration.
+    ; This loop itself executes (N+1) cycles; total low interval also includes
+    ; fixed instructions before/after plus possible `irq wait` stall.
+    jmp y--, loop2 
+    nop
+
+    ; Notify CPU that a full gate period completed.
+    ; `wait` means if IRQ flag is still set (CPU not yet cleared), stall here.
+    ; This prevents overrunning host processing with back-to-back interrupts.
+    ; Timing impact: this is the only intentionally host-latency-dependent point
+    ; in the `gate` waveform loop.
+    irq wait 0
+.wrap
+
+.program fin_cntr
+.wrap_target
+    ; Block until host provides initial counter seed (typically UINT32_MAX).
+    pull 
+    mov x, osr
+
+    ; Synchronize startup: wait until gate pin is high before counting.
+    ; Uses absolute GPIO index 8 (not relative pin mapping).
+    wait 1 gpio 8
+loop:
+    ; Count one full pulse on input pin 0 (mapped from `sm_config_set_in_pins`):
+    ; - wait for falling edge / low state
+    ; - then wait for rising edge / high state
+    ; This sequence counts complete periods and rejects partial startup levels.
+    ; Per-pulse fixed overhead once both waits are satisfied: 2 instructions
+    ; (`jmp x--`, `jmp pin`) before returning to waits.
+    wait 0 pin 0
+    wait 1 pin 0
+
+    ; Decrement pulse budget/counter once per detected pulse.
+    ; If X underflows past zero, behavior follows PIO jmp x-- semantics.
+    jmp x--, cont
+cont:
+    ; Continue counting only while gate is active.
+    ; `jmp pin` tests the configured jump pin level:
+    ;   - high  -> jump to `loop` and keep counting
+    ;   - low   -> gate ended, finalize and report
+    jmp pin loop
+
+    ; End-of-gate snapshot:
+    ; - copy remaining X into ISR
+    ; - push to RX FIFO for CPU ISR to read
+    ; Host computes pulses as (UINT32_MAX - X_snapshot).
+    mov isr, x
+    push
+
+    ; Do not start a new cycle until host acknowledges IRQ handling.
+    ; Wait for IRQ 0 to be cleared by CPU-side interrupt handler.
+    wait 0 irq 0
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include <limits.h>
+
+// -----------------------------------------------------------------------------
+// init_gate
+// -----------------------------------------------------------------------------
+// Configures the `gate` PIO program:
+//   - side-set pin drives gate output waveform
+//   - initial gate duration value is written once to TX FIFO
+//   - state machine starts immediately and then free-runs
+//
+// Parameters:
+//   pio      : PIO instance (pio0/pio1)
+//   sm       : state machine index used by `gate` program
+//   offset   : loaded program offset from `pio_add_program`
+//   sidepin  : GPIO used as side-set output (gate signal)
+//   gatetime : countdown preload consumed by `pull` into OSR (cycle-based)
+//
+// Notes:
+//   - `gatetime` is passed as float by caller but consumed as 32-bit integer
+//     payload in TX FIFO. Keep values in integer-safe range to avoid ambiguity.
+//   - Clock divider is currently default (SM clock ~= system-derived PIO clock).
+//   - If you later configure clock divider:
+//       f_sm = clock_get_hz(clk_sys) / div
+//       T_high ≈ (N + 1) / f_sm
+//     (ignoring asynchronous stalls outside the high loop).
+static inline void init_gate(PIO pio, uint sm, uint offset, uint sidepin, float gatetime) {
+    pio_sm_config c = gate_program_get_default_config(offset);
+
+    // Route side-set bit to requested pin and configure pin as output.
+    sm_config_set_sideset_pins(&c, sidepin);
+    pio_gpio_init(pio, sidepin);
+    pio_sm_set_consecutive_pindirs(pio, sm, sidepin, 1, true);  // set output direction for pin
+
+    //float div = clock_get_hz(clk_sys) / freq;
+    //sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    // First TX word becomes OSR value used by `pull` at program start.
+    pio_sm_put(pio, sm, gatetime);
+    pio_sm_set_enabled(pio, sm, true);
+
+}
+
+// -----------------------------------------------------------------------------
+// init_fin_cntr
+// -----------------------------------------------------------------------------
+// Configures the `fin_cntr` PIO program:
+//   - input pulses are observed on `inpin` via `wait ... pin 0`
+//   - gate state is sampled via jump pin (`jmp pin ...`)
+//   - initial down-counter seed is written to TX FIFO
+//
+// Parameters:
+//   pio     : PIO instance (pio0/pio1)
+//   sm      : state machine index used by `fin_cntr`
+//   offset  : loaded program offset from `pio_add_program`
+//   inpin   : GPIO carrying measured frequency input
+//   jmppin  : GPIO level used to decide if counting continues (gate active)
+//
+// Notes:
+//   - Caller currently seeds with UINT32_MAX for "count-down then subtract".
+//   - `wait 1 gpio 8` inside the PIO program uses absolute GPIO 8; ensure this
+//     matches hardware wiring, or update the instruction if gate pin changes.
+//   - Reported count word is remaining X at gate end, so:
+//       pulses = seed - captured_x
+//     with current seed = UINT32_MAX.
+static inline void init_fin_cntr(PIO pio, uint sm, uint offset, uint inpin, uint jmppin) {
+    pio_sm_config c = fin_cntr_program_get_default_config(offset);
+
+    // Map relative pin 0 references in program to `inpin`.
+    sm_config_set_in_pins(&c, inpin);
+    // Select pin used by `jmp pin`.
+    sm_config_set_jmp_pin(&c, jmppin);
+    pio_gpio_init(pio, inpin);
+    pio_sm_set_consecutive_pindirs(pio, sm, inpin, 1, false);  // set output direction for pin
+
+    //float div = clock_get_hz(clk_sys) / freq;
+    //sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    // Initial down-counter seed consumed by initial `pull`.
+    pio_sm_put(pio, sm, UINT32_MAX);
+    pio_sm_set_enabled(pio, sm, true);
+
+}
+%}
