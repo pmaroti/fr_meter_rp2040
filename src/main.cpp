@@ -9,6 +9,9 @@
 TM1637 TM;
 
 #define ZERO_LED_BUILTIN           8
+#define FR_INPUT_PIN               15
+#define RANGE_SEL_PIN              14  // Pulled-up input: HIGH = direct, LOW = external /64 prescaler in use.
+#define PRESCALER_RATIO            64
 
 // Set from IRQ when a new measurement is available for loop().
 volatile bool updated = false;
@@ -60,8 +63,11 @@ void setup() {
 
     // Load and initialize frequency counter PIO program on state machine 1.
     offset = pio_add_program(pio0, &fin_cntr_program);
-    init_fin_cntr(pio0, 1, offset, 15, ZERO_LED_BUILTIN);
-    gpio_pull_down(15);
+    init_fin_cntr(pio0, 1, offset, FR_INPUT_PIN, ZERO_LED_BUILTIN);
+    gpio_pull_down(FR_INPUT_PIN);
+
+    // Range selector: HIGH (default via pull-up) = direct, LOW = /64 prescaler in signal path.
+    pinMode(RANGE_SEL_PIN, INPUT_PULLUP);
 
     // Route PIO interrupt 0 to CPU IRQ handler.
     pio_set_irq0_source_enabled(pio0, pis_interrupt0, true);
@@ -78,6 +84,12 @@ void loop() {
         // Convert captured pulse count to MHz.
         // Gate time is 0.1 s, so 100000 counts correspond to 1 MHz.
         fr = ((float)(UINT32_MAX-pulseCount))/100000.0; // Convert frequency to Mhz as gate time is 0.1s
+
+        // If range selector is grounded, an external /64 prescaler is in the signal path;
+        // compensate by multiplying the measured value.
+        if (digitalRead(RANGE_SEL_PIN) == LOW) {
+            fr *= PRESCALER_RATIO;
+        }
 
         // Dynamic decimal precision to keep meaningful resolution on 4 digits.
         if (fr < 10.0) { 
